@@ -25,6 +25,7 @@ struct Config {
     var settle: TimeInterval = 0.3  // wait this long after a drop before acting
     var bounceHold: UInt32 = 100_000 // µs to hold the built-in device during a bounce
     var verbose = false
+    var testMute = false // mute/unmute the built-in devices once and report, then exit
 }
 
 var config = Config()
@@ -34,6 +35,7 @@ while let a = args.next() {
     case "--address": config.address = args.next()?.uppercased()
     case "--settle": config.settle = TimeInterval(args.next() ?? "") ?? config.settle
     case "-v", "--verbose": config.verbose = true
+    case "--test-mute": config.testMute = true
     case "-h", "--help":
         print("usage: xm4-call-rescue [--address AA:BB:CC:DD:EE:FF] [--settle seconds] [-v]")
         exit(0)
@@ -148,10 +150,50 @@ func bounce(_ sel: AudioObjectPropertySelector, scope: AudioObjectPropertyScope,
         temp = headset
     }
     guard let other = temp, other != current else { return false }
+    // Mute the built-in device while it's the temporary default, so no call audio
+    // leaks out of the laptop speakers (or into the call from the laptop mic).
+    let restoreMute = isBuiltIn(other) ? mute(other, scope: scope) : nil
     setDefaultDevice(sel, other)
     usleep(config.bounceHold)
     setDefaultDevice(sel, current)
+    if let restore = restoreMute {
+        usleep(150_000) // let in-flight buffers drain before unmuting
+        restore()
+    }
     return true
+}
+
+/// Mutes a device and returns a closure that puts back its previous state. Uses
+/// the mute control if the device has one, otherwise sets the volume to 0. Returns
+/// nil if neither control is settable.
+func mute(_ dev: AudioObjectID, scope: AudioObjectPropertyScope) -> (() -> Void)? {
+    func settable(_ a: inout AudioObjectPropertyAddress) -> Bool {
+        var ok: DarwinBoolean = false
+        return AudioObjectHasProperty(dev, &a)
+            && AudioObjectIsPropertySettable(dev, &a, &ok) == noErr && ok.boolValue
+    }
+    var muteAddr = address(kAudioDevicePropertyMute, scope)
+    if settable(&muteAddr), let was = getUInt32(dev, kAudioDevicePropertyMute, scope) {
+        var on: UInt32 = 1
+        AudioObjectSetPropertyData(dev, &muteAddr, 0, nil, 4, &on)
+        return {
+            var a = address(kAudioDevicePropertyMute, scope)
+            var v = was
+            AudioObjectSetPropertyData(dev, &a, 0, nil, 4, &v)
+        }
+    }
+    var volAddr = address(kAudioDevicePropertyVolumeScalar, scope)
+    var was: Float32 = 0
+    var size = UInt32(4)
+    guard settable(&volAddr), AudioObjectGetPropertyData(dev, &volAddr, 0, nil, &size, &was) == noErr
+    else { return nil }
+    var zero: Float32 = 0
+    AudioObjectSetPropertyData(dev, &volAddr, 0, nil, 4, &zero)
+    return {
+        var a = address(kAudioDevicePropertyVolumeScalar, scope)
+        var v = was
+        AudioObjectSetPropertyData(dev, &a, 0, nil, 4, &v)
+    }
 }
 
 /// The headset's output device (same Bluetooth address as its HFP input).
@@ -208,6 +250,24 @@ func startLogStream() -> Process {
 }
 
 // MARK: - Main loop
+
+if config.testMute {
+    for (label, scope) in [("speakers", kAudioObjectPropertyScopeOutput), ("mic", kAudioObjectPropertyScopeInput)] {
+        guard let dev = builtIn(scope) else { print("\(label): no built-in device"); continue }
+        func state() -> String {
+            let m = getUInt32(dev, kAudioDevicePropertyMute, scope).map { "mute=\($0)" } ?? "mute=n/a"
+            var v: Float32 = -1; var a = address(kAudioDevicePropertyVolumeScalar, scope); var sz = UInt32(4)
+            AudioObjectGetPropertyData(dev, &a, 0, nil, &sz, &v)
+            return "\(m) volume=\(v)"
+        }
+        let before = state()
+        guard let restore = mute(dev, scope: scope) else { print("\(name(dev)): can't be muted"); continue }
+        let during = state()
+        restore()
+        print("\(name(dev)): before[\(before)] muted[\(during)] after[\(state())]")
+    }
+    exit(0)
+}
 
 let logProcess = startLogStream()
 signal(SIGTERM) { _ in logProcess.terminate(); exit(0) }

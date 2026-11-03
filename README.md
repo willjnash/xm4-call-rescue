@@ -16,6 +16,8 @@ device as running, so macOS never re-creates the link and the call keeps sending
 
 Logs: `~/Library/Logs/xm4-call-rescue.log`
 
+Check that the built-in devices can be muted and restored: `./xm4-call-rescue --test-mute`
+
 ## Caveats
 
-- Each fix attempt makes the built-in speakers and mic the defaults for ~0.1s each. If your call app follows the system default, a fraction of a second of call audio may come from the Mac speakers.
+- Each fix attempt makes the built-in speakers and mic the defaults for ~0.1s. They're muted for that moment (your mute state and volume are restored right after), so nothing plays from the laptop and the laptop mic doesn't leak into the call.
